@@ -1,0 +1,23 @@
+[package]
+name = "gifthub-rust-ai"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dotenv = "0.15"
+log = "0.4"
+env_logger = "0.11"
+
+# Size-optimized release binary — this whole service exists to shave server RAM,
+# so the binary is built small (mirrors the vpn-watchdog house profile).
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+codegen-units = 1
+panic = "abort"
