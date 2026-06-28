@@ -30,13 +30,25 @@ async fn main() {
         cfg.provider_order_display()
     );
 
-    let mut conn = match redis_io::init_redis(&cfg.redis_url).await {
+    // Two separate Redis connections, on purpose. BLPOP is a *blocking* command and holds its
+    // underlying multiplexed connection until it returns (redis-rs multiplexed_connection.rs docs),
+    // so it must not share a connection with the result writers — otherwise every RPUSH would stall
+    // behind an in-flight BLPOP. `consumer` does only the blocking pop; `publisher` (cloned into each
+    // per-job task) does the writes.
+    let mut consumer = match redis_io::init_redis(&cfg.redis_url).await {
+        Ok(c) => c,
+        Err(e) => {
+            log::error!("❌ Redis (consumer) connection failed: {e}");
+            return;
+        }
+    };
+    let publisher = match redis_io::init_redis(&cfg.redis_url).await {
         Ok(c) => {
             log::info!("✅ connected to Redis");
             c
         }
         Err(e) => {
-            log::error!("❌ Redis connection failed: {e}");
+            log::error!("❌ Redis (publisher) connection failed: {e}");
             return;
         }
     };
@@ -69,28 +81,43 @@ async fn main() {
     );
 
     loop {
-        tokio::select! {
-            _ = shutdown_rx.changed() => {
-                log::info!("shutdown signal received, stopping job loop");
-                break;
-            }
-            res = redis_io::brpop_job(&mut conn, &cfg.jobs_key, cfg.brpop_timeout_secs) => {
-                match res {
-                    Ok(Some(raw)) => {
-                        // Fire-and-forget per job; the semaphore bounds concurrent upstream calls.
-                        let conn = conn.clone();
-                        let client = client.clone();
-                        let sem = sem.clone();
-                        tokio::spawn(async move { handle_job(conn, cfg, client, sem, raw).await });
-                    }
-                    Ok(None) => { /* BRPOP timed out — loop to re-check shutdown */ }
-                    Err(e) => {
-                        log::error!("BRPOP error: {e} (backing off 1s)");
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                    }
+        // Backpressure: take a permit BEFORE popping, so we never pop more jobs than we can run.
+        // This bounds *in-flight tasks* (not just concurrent HTTP calls) and lets shutdown drain.
+        let permit = tokio::select! {
+            _ = shutdown_rx.changed() => break,
+            p = Arc::clone(&sem).acquire_owned() => p.expect("semaphore should not be closed"),
+        };
+
+        let raw = tokio::select! {
+            _ = shutdown_rx.changed() => break, // permit dropped here, returns to the pool
+            res = redis_io::pop_job(&mut consumer, &cfg.jobs_key, cfg.pop_timeout_secs) => match res {
+                Ok(Some(raw)) => raw,
+                Ok(None) => continue, // BLPOP timed out — drop permit, re-check shutdown
+                Err(e) => {
+                    log::error!("BLPOP error: {e} (backing off 1s)");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
                 }
-            }
-        }
+            },
+        };
+
+        // Each task gets its own publisher clone (separate from the BLPOP connection) and holds the
+        // permit until it finishes, so `max_concurrency` caps concurrent jobs end-to-end.
+        let conn = publisher.clone();
+        let client = client.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            handle_job(conn, cfg, client, raw).await;
+        });
+    }
+
+    // Graceful drain: in-flight jobs each hold a permit, so acquiring them all means every job has
+    // finished publishing. Capped so a stuck upstream call can't hang shutdown forever.
+    log::info!("shutdown signal received; draining in-flight jobs…");
+    let drain = Arc::clone(&sem).acquire_many_owned(cfg.max_concurrency as u32);
+    match tokio::time::timeout(Duration::from_secs(cfg.request_timeout_secs + 5), drain).await {
+        Ok(_) => log::info!("all in-flight jobs finished"),
+        Err(_) => log::warn!("shutdown grace expired with jobs still in flight"),
     }
 
     log::info!("gifthub-rust-ai stopped");
@@ -101,7 +128,6 @@ async fn handle_job(
     mut conn: ConnectionManager,
     cfg: &'static Config,
     client: reqwest::Client,
-    sem: Arc<Semaphore>,
     raw: String,
 ) {
     let job: job::Job = match serde_json::from_str(&raw) {
@@ -131,13 +157,6 @@ async fn handle_job(
             last_err = format!("{name}: rate-limited");
             continue;
         }
-
-        // Bound concurrent upstream calls (owned permit so it can cross the spawn boundary).
-        let _permit = sem
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("semaphore should not be closed");
 
         match provider::call_with_retry(
             provider,

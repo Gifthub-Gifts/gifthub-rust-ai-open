@@ -11,8 +11,8 @@ it only reads jobs from Redis, calls LLM providers, and writes results back to R
 
 ```
 Django (Celery task)                          gifthub-rust-ai (this service)
-  build prompt                                   BRPOP ai_jobs  ───────────────┐
-  RPUSH ai_jobs {job_id,purpose,messages} ─────▶ run failover chain:           │
+  build prompt                                   BLPOP ai_jobs  ───────────────┐
+  RPUSH ai_jobs {job_id,purpose,messages} ─────▶ run failover chain (FIFO):    │
                                                    provider A → 429/empty/err → B → …
   BRPOP ai_result:{job_id}  ◀───────────────────  RPUSH ai_result:{job_id} {…} ┘
   write ProductContent DRAFT (Django owns DB)
@@ -69,3 +69,18 @@ Mirrors the GiftHub deploy pattern: build the release binary in CI, scp it to th
 rename, restart a `gifthub-rust-ai.service` systemd unit, health-check via journald (grep the
 `🚀 gifthub-rust-ai started` ready marker), roll back to the previous binary on failure. Org-level
 deploy secrets are reused from the `Gifthub-Gifts` org. (Not wired up yet — see the roadmap.)
+
+## Known limitations (this is a scaffold)
+
+- **No integration test yet.** Unit tests cover pure logic only; the Redis/provider wiring has not
+  been run end-to-end against a live Redis or real LLM endpoints. Next milestone: a smoke test
+  against a local Redis + one provider.
+- **At-least-once is not guaranteed.** A job is popped with `BLPOP` (removed from `ai_jobs`) before
+  it's processed; if the gateway *crashes* between pop and publish, that job is lost and Django's
+  `BRPOP ai_result:{job_id}` will time out (re-enqueue on the Django side). A graceful shutdown
+  (SIGTERM) now drains in-flight jobs, so this only bites on a hard crash; a fully reliable-queue
+  pattern (`LMOVE` into a processing list + reclaim) is still deferred.
+- **`panic = "abort"`** (size-optimized profile) means a panic in any task aborts the whole process
+  — there is no per-task isolation. The hot path avoids panics; `systemd Restart=always` recovers.
+- **Neuron accounting is effectively off** with the documented OpenAI-compat Cloudflare endpoint —
+  `cf-ai-neurons` is only returned by the native `/ai/run` endpoint (see `provider.rs`).

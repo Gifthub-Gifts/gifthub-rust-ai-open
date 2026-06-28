@@ -15,13 +15,17 @@ pub async fn init_redis(url: &str) -> redis::RedisResult<ConnectionManager> {
 
 /// Block up to `timeout_secs` for the next job on `key`. Returns the raw JSON payload,
 /// or `None` if the blocking pop timed out (so the caller can re-check shutdown).
-pub async fn brpop_job(
+///
+/// Uses `BLPOP` (pop the head) while Django enqueues with `RPUSH` (push the tail) — opposite
+/// ends, so the queue is FIFO (oldest job first). Popping the same end Django pushes would make
+/// it LIFO and starve old jobs under backlog.
+pub async fn pop_job(
     conn: &mut ConnectionManager,
     key: &str,
     timeout_secs: u64,
 ) -> redis::RedisResult<Option<String>> {
-    // BRPOP returns [key, value] or nil on timeout.
-    let res: Option<(String, String)> = redis::cmd("BRPOP")
+    // BLPOP returns [key, value] or nil on timeout.
+    let res: Option<(String, String)> = redis::cmd("BLPOP")
         .arg(key)
         .arg(timeout_secs)
         .query_async(conn)
@@ -39,15 +43,18 @@ pub async fn publish_result(
     payload: &str,
 ) -> redis::RedisResult<()> {
     let key = format!("{prefix}{job_id}");
-    redis::cmd("RPUSH")
+    // RPUSH + EXPIRE in one pipelined round-trip, so we can't crash/disconnect between them and
+    // leave the result key without a TTL (which would leak it forever if Django never consumes it).
+    redis::pipe()
+        .cmd("RPUSH")
         .arg(&key)
         .arg(payload)
-        .query_async::<i64>(conn)
-        .await?;
-    redis::cmd("EXPIRE")
+        .ignore()
+        .cmd("EXPIRE")
         .arg(&key)
         .arg(ttl_secs)
-        .query_async::<i64>(conn)
+        .ignore()
+        .query_async::<()>(conn)
         .await?;
     Ok(())
 }

@@ -28,7 +28,7 @@ pub struct Config {
     pub jobs_key: String,
     pub result_prefix: String,
     pub result_ttl_secs: u64,
-    pub brpop_timeout_secs: u64,
+    pub pop_timeout_secs: u64,
     pub max_concurrency: usize,
     pub connect_timeout_secs: u64,
     pub request_timeout_secs: u64,
@@ -101,7 +101,7 @@ impl Config {
             result_prefix: env::var("AI_RESULT_PREFIX")
                 .unwrap_or_else(|_| "ai_result:".to_string()),
             result_ttl_secs: parse_or("AI_RESULT_TTL_SECS", 300u64),
-            brpop_timeout_secs: parse_or("BRPOP_TIMEOUT_SECS", 5u64),
+            pop_timeout_secs: parse_or("POP_TIMEOUT_SECS", 5u64),
             max_concurrency: parse_or("MAX_CONCURRENCY", 4usize),
             connect_timeout_secs: parse_or("CONNECT_TIMEOUT_SECS", 15u64),
             request_timeout_secs: parse_or("REQUEST_TIMEOUT_SECS", 60u64),

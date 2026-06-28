@@ -64,7 +64,10 @@ impl Provider {
             })?;
 
         let status = resp.status();
-        // Cloudflare reports cost via this header on its OpenAI-compat endpoint; others omit it.
+        // Cloudflare exposes `cf-ai-neurons` only on its *native* `/ai/run/{model}` endpoint, NOT the
+        // OpenAI-compat `/ai/v1/chat/completions` one we call here — so this is usually `None`. We read
+        // it opportunistically (harmless) for setups that proxy the native endpoint; real neuron
+        // accounting would need a native-endpoint code path (future work).
         let neurons = resp
             .headers()
             .get("cf-ai-neurons")

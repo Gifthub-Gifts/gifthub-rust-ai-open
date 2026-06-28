@@ -11,6 +11,8 @@ pub fn build_http_client(connect_timeout_secs: u64, request_timeout_secs: u64) -
         .connect_timeout(Duration::from_secs(connect_timeout_secs))
         .timeout(Duration::from_secs(request_timeout_secs))
         .build()
-        // Builder only fails on TLS backend init; fall back rather than panic at boot.
-        .unwrap_or_else(|_| reqwest::Client::new())
+        // Builder only fails on TLS backend init. Don't fall back to `Client::new()` — that client
+        // has no timeouts (the very thing this fn exists to enforce), and a broken TLS backend means
+        // no request would succeed anyway. Fail loudly at boot instead.
+        .expect("failed to build HTTP client (TLS backend init error)")
 }

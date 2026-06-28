@@ -28,5 +28,6 @@ jobs:
       - run: cargo build --release --locked
       # Binary sanity (size matters — this service exists to save RAM).
       - run: ls -la target/release/gifthub-rust-ai && du -h target/release/gifthub-rust-ai
-      # Clippy is informational, matching the reference repos' house style.
-      - run: cargo clippy --all-targets --locked -- -A clippy::all || true
+      # Clippy is a gate here (stricter than the reference bots' informational clippy) — the code
+      # is clippy-clean today, so keep it that way.
+      - run: cargo clippy --all-targets --locked -- -D warnings
