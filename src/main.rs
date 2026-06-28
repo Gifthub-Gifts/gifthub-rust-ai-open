@@ -2,7 +2,7 @@
 //!
 //! Django enqueues `{job_id, purpose, messages}` onto the `ai_jobs` Redis list; this service pops
 //! each job, runs the per-purpose provider failover chain (with per-provider rpm/rpd budgets), and
-//! pushes `{job_id, content|error, provider, neurons}` back onto `ai_result:{job_id}`. Django owns
+//! pushes `{job_id, content|error, provider, model, neurons}` back onto `ai_result:{job_id}`. Django owns
 //! every database write — this binary only computes and answers over Redis.
 
 mod config;
@@ -176,7 +176,13 @@ async fn handle_job(
                     job.job_id,
                     out.content.len()
                 );
-                let result = job::JobResult::ok(&job.job_id, out.content, name, out.neurons);
+                let result = job::JobResult::ok(
+                    &job.job_id,
+                    out.content,
+                    name,
+                    &provider.model,
+                    out.neurons,
+                );
                 publish(&mut conn, cfg, &job.job_id, &result).await;
                 return;
             }

@@ -31,17 +31,27 @@ pub struct JobResult {
     pub error: Option<String>,
     /// Which provider produced the content (None on failure).
     pub provider: Option<String>,
+    /// The exact model that produced the content, e.g. `@cf/meta/llama-3.3-70b-instruct-fp8-fast`
+    /// (None on failure). Django records this so a draft shows the real model, not a static guess.
+    pub model: Option<String>,
     /// Cloudflare neuron cost, when the provider reported it (`cf-ai-neurons` header).
     pub neurons: Option<f64>,
 }
 
 impl JobResult {
-    pub(crate) fn ok(job_id: &str, content: String, provider: &str, neurons: Option<f64>) -> Self {
+    pub(crate) fn ok(
+        job_id: &str,
+        content: String,
+        provider: &str,
+        model: &str,
+        neurons: Option<f64>,
+    ) -> Self {
         Self {
             job_id: job_id.to_string(),
             content: Some(content),
             error: None,
             provider: Some(provider.to_string()),
+            model: Some(model.to_string()),
             neurons,
         }
     }
@@ -52,6 +62,7 @@ impl JobResult {
             content: None,
             error: Some(error),
             provider: None,
+            model: None,
             neurons: None,
         }
     }
@@ -73,11 +84,18 @@ mod tests {
 
     #[test]
     fn result_serializes_success_and_error_shapes() {
-        let ok = JobResult::ok("abc", "hello".into(), "openrouter", Some(58.7));
+        let ok = JobResult::ok(
+            "abc",
+            "hello".into(),
+            "openrouter",
+            "google/gemma:free",
+            Some(58.7),
+        );
         let v: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&ok).unwrap()).unwrap();
         assert_eq!(v["content"], "hello");
         assert_eq!(v["provider"], "openrouter");
+        assert_eq!(v["model"], "google/gemma:free");
         assert!(v["error"].is_null());
 
         let err = JobResult::err("abc", "all providers failed".into());

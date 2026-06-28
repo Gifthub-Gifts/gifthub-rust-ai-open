@@ -31,8 +31,11 @@ Producer (Django) → `ai_jobs` (list), JSON:
 Consumer (Django) ← `ai_result:{job_id}` (list, TTL'd), JSON — exactly one of `content`/`error`:
 
 ```json
-{ "job_id": "uuid", "content": "…", "error": null, "provider": "cloudflare", "neurons": 58.7 }
+{ "job_id": "uuid", "content": "…", "error": null, "provider": "cloudflare", "model": "@cf/meta/llama-3.3-70b-instruct-fp8-fast", "neurons": 58.7 }
 ```
+
+- `provider` / `model` name the source of the content (both `null` on failure) so Django can record
+  the real model on each draft instead of guessing.
 
 ## Design
 
@@ -42,7 +45,9 @@ Consumer (Django) ← `ai_result:{job_id}` (list, TTL'd), JSON — exactly one o
   provider. Transient transport errors are retried per-provider with `2s, 5s, 11s, …` backoff.
 - **Per-provider budgets.** rpm + rpd token buckets (lazy proportional refill) skip an exhausted
   provider rather than burning its upstream quota.
-- **No `max_tokens`** is sent — capping it makes some reasoning models return empty content.
+- **`max_tokens` is opt-in per provider** (`NAME_MAX_TOKENS`) — omitted by default (a low cap makes
+  some reasoning models return empty content), but **required for Cloudflare**, which otherwise
+  truncates at ~256 tokens.
 - **Cloudflare neuron accounting** is captured from the `cf-ai-neurons` response header when present.
 
 ## Run
