@@ -61,14 +61,17 @@ cargo test
 cargo clippy --all-targets
 ```
 
-CI runs `fmt --check`, `check`, `test`, release `build` (all `--locked`), and informational clippy.
+CI runs `fmt --check`, `check`, `test`, release `build` (all `--locked`), and `clippy -D warnings`.
 
-## Deploy (planned)
+## Deploy
 
-Mirrors the GiftHub deploy pattern: build the release binary in CI, scp it to the host, atomic
-rename, restart a `gifthub-rust-ai.service` systemd unit, health-check via journald (grep the
-`🚀 gifthub-rust-ai started` ready marker), roll back to the previous binary on failure. Org-level
-deploy secrets are reused from the `Gifthub-Gifts` org. (Not wired up yet — see the roadmap.)
+`.github/workflows/deploy.yml` (push to `main` or manual `workflow_dispatch` with a `DEPLOY`
+confirm) builds the release binary, scp's it to the host, atomic-renames, restarts the
+`gifthub-rust-ai.service` systemd unit, health-checks via journald (greps the
+`🚀 gifthub-rust-ai started` ready marker), and rolls back to the previous binary on failure. The
+binary is the whole artifact — there's no DB/migrations. Runtime config (`REDIS_URL` + provider API
+keys) lives in a host `.env`, never in CI. Setup, the unit (`deploy/gifthub-rust-ai.service`), and
+the required GitHub secrets are documented in **[DEPLOY.md](DEPLOY.md)**.
 
 ## Known limitations (this is a scaffold)
 
