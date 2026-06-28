@@ -71,6 +71,10 @@ impl Config {
                 .unwrap_or_else(|_| panic!("{up}_MODEL must be set"));
             let rpm = parse_or(&format!("{up}_RPM"), default_rpm);
             let rpd = parse_or(&format!("{up}_RPD"), default_rpd);
+            // Optional: only sent when set (Cloudflare needs it or it truncates at ~256 tokens).
+            let max_tokens = env::var(format!("{up}_MAX_TOKENS"))
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok());
             providers.insert(
                 name.clone(),
                 Provider {
@@ -80,6 +84,7 @@ impl Config {
                     model,
                     rpm,
                     rpd,
+                    max_tokens,
                 },
             );
         }

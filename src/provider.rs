@@ -23,6 +23,9 @@ pub struct Provider {
     pub model: String,
     pub rpm: u32,
     pub rpd: u32,
+    /// Optional output cap. Most providers complete fine without one, but Cloudflare Workers AI
+    /// truncates at ~256 tokens unless this is sent — set `{NAME}_MAX_TOKENS` for those.
+    pub max_tokens: Option<u32>,
 }
 
 /// A successful completion plus optional cost metadata.
@@ -35,11 +38,14 @@ pub struct Completion {
 struct ChatRequest<'a> {
     model: &'a str,
     messages: &'a [Message],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
 }
 
 impl Provider {
-    /// One attempt against this provider. No `max_tokens` is sent — capping it makes some
-    /// reasoning models return empty `content` (see the roadmap findings).
+    /// One attempt against this provider. `max_tokens` is sent only when configured
+    /// (`{NAME}_MAX_TOKENS`): omit it for providers where a low cap makes reasoning models return
+    /// empty `content`; set it for Cloudflare, which otherwise truncates at ~256 tokens.
     async fn call(
         &self,
         client: &reqwest::Client,
@@ -48,6 +54,7 @@ impl Provider {
         let req = ChatRequest {
             model: &self.model,
             messages,
+            max_tokens: self.max_tokens,
         };
         let resp = client
             .post(&self.base_url)
@@ -151,10 +158,28 @@ mod tests {
         let body = serde_json::to_value(ChatRequest {
             model: "m",
             messages: &msgs,
+            max_tokens: None,
         })
         .unwrap();
         assert_eq!(body["model"], "m");
         assert_eq!(body["messages"][0]["role"], "user");
         assert_eq!(body["messages"][0]["content"], "hi");
+        // None is omitted entirely (so providers that dislike a cap never see the field).
+        assert!(body.get("max_tokens").is_none());
+    }
+
+    #[test]
+    fn chat_request_includes_max_tokens_when_set() {
+        let msgs = vec![Message {
+            role: "user".into(),
+            content: "hi".into(),
+        }];
+        let body = serde_json::to_value(ChatRequest {
+            model: "m",
+            messages: &msgs,
+            max_tokens: Some(4096),
+        })
+        .unwrap();
+        assert_eq!(body["max_tokens"], 4096);
     }
 }
