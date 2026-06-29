@@ -38,7 +38,8 @@ pub struct Config {
     /// Declared order of `AI_PROVIDERS` (also the default failover chain).
     pub provider_order: Vec<String>,
     pub default_chain: Vec<String>,
-    /// Per-purpose failover chains, e.g. `"writer"` / `"judge"`.
+    /// Per-task failover chains keyed by task name (e.g. `writer`, `judge`, `generator`,
+    /// `translator`, `reviewer`), discovered generically from `AI_CHAIN_<TASK>` env vars.
     pub chains: HashMap<String, Vec<String>>,
 }
 
@@ -92,12 +93,16 @@ impl Config {
         let default_chain =
             parse_chain("AI_CHAIN_DEFAULT", &providers).unwrap_or_else(|| provider_order.clone());
 
+        // Generic per-task chains: any `AI_CHAIN_<TASK>` env var becomes a chain keyed by the
+        // lowercased task (writer, judge, generator, translator, reviewer, …). `AI_CHAIN_DEFAULT`
+        // is the fallback (handled above) and is skipped here. A job's `purpose` selects the chain.
         let mut chains = HashMap::new();
-        if let Some(c) = parse_chain("AI_CHAIN_WRITER", &providers) {
-            chains.insert("writer".to_string(), c);
-        }
-        if let Some(c) = parse_chain("AI_CHAIN_JUDGE", &providers) {
-            chains.insert("judge".to_string(), c);
+        for (key, _) in env::vars() {
+            if let Some(task) = chain_task_name(&key) {
+                if let Some(c) = parse_chain(&key, &providers) {
+                    chains.insert(task, c);
+                }
+            }
         }
 
         Config {
@@ -139,10 +144,28 @@ fn parse_or<T: std::str::FromStr>(key: &str, default: T) -> T {
         .unwrap_or(default)
 }
 
-/// Parse a comma-separated chain, dropping (with a warning) any name not in `providers`.
-/// Returns `None` if the var is unset or resolves to no known providers.
+/// The task name from an `AI_CHAIN_<TASK>` env key, lowercased — or `None` for non-chain keys and
+/// the special `AI_CHAIN_DEFAULT` (which is the fallback, not a task).
+fn chain_task_name(key: &str) -> Option<String> {
+    let task = key.strip_prefix("AI_CHAIN_")?;
+    if task.is_empty() || task == "DEFAULT" {
+        return None;
+    }
+    Some(task.to_lowercase())
+}
+
+/// Parse a comma-separated chain from `key`'s env value, dropping (with a warning) any name not in
+/// `providers`. Returns `None` if the var is unset or resolves to no known providers.
 fn parse_chain(key: &str, providers: &HashMap<String, Provider>) -> Option<Vec<String>> {
-    let raw = env::var(key).ok()?;
+    parse_chain_str(key, &env::var(key).ok()?, providers)
+}
+
+/// Pure core of [`parse_chain`] (no env access), so it's unit-testable.
+fn parse_chain_str(
+    key: &str,
+    raw: &str,
+    providers: &HashMap<String, Provider>,
+) -> Option<Vec<String>> {
     let chain: Vec<String> = raw
         .split(',')
         .map(|s| s.trim().to_lowercase())
@@ -161,5 +184,59 @@ fn parse_chain(key: &str, providers: &HashMap<String, Provider>) -> Option<Vec<S
         None
     } else {
         Some(chain)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn providers(names: &[&str]) -> HashMap<String, Provider> {
+        names
+            .iter()
+            .map(|n| {
+                (
+                    n.to_string(),
+                    Provider {
+                        name: n.to_string(),
+                        base_url: String::new(),
+                        api_key: String::new(),
+                        model: String::new(),
+                        rpm: 1,
+                        rpd: 1,
+                        max_tokens: None,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn chain_task_name_extracts_and_skips_default_and_nonchain() {
+        assert_eq!(
+            chain_task_name("AI_CHAIN_TRANSLATOR"),
+            Some("translator".into())
+        );
+        assert_eq!(chain_task_name("AI_CHAIN_WRITER"), Some("writer".into()));
+        assert_eq!(chain_task_name("AI_CHAIN_DEFAULT"), None);
+        assert_eq!(chain_task_name("AI_CHAIN_"), None);
+        assert_eq!(chain_task_name("REDIS_URL"), None);
+    }
+
+    #[test]
+    fn parse_chain_str_orders_and_filters_unknown() {
+        let p = providers(&["gemini_lite", "gemini_flash", "cloudflare"]);
+        assert_eq!(
+            parse_chain_str("k", "gemini_lite, gemini_flash", &p),
+            Some(vec!["gemini_lite".into(), "gemini_flash".into()])
+        );
+        // unknown providers are dropped, known ones kept in order
+        assert_eq!(
+            parse_chain_str("k", "gemini_lite, nope, cloudflare", &p),
+            Some(vec!["gemini_lite".into(), "cloudflare".into()])
+        );
+        // all-unknown and empty both resolve to None
+        assert_eq!(parse_chain_str("k", "nope, nada", &p), None);
+        assert_eq!(parse_chain_str("k", "", &p), None);
     }
 }
