@@ -16,6 +16,7 @@ mod error;
 mod http;
 mod job;
 mod provider;
+mod quota;
 mod ratelimit;
 mod redis_io;
 
@@ -79,9 +80,24 @@ async fn main() {
         shutdown_tx.send(true).ok();
     });
 
+    // Load any provider limits learned on a prior run (persisted to Redis), so after a redeploy we
+    // pace off the last-known real numbers instead of re-learning them (re-bursting into 429s).
+    {
+        let mut conn = publisher.clone();
+        match redis_io::get_value(&mut conn, &cfg.learned_limits_key).await {
+            Ok(Some(json)) => ratelimit::import_learned(&json, &cfg.provider_budgets()),
+            Ok(None) => {}
+            Err(e) => log::warn!(
+                "could not load learned limits from '{}': {e}",
+                cfg.learned_limits_key
+            ),
+        }
+    }
+
     // Budget publisher: republish the live pool `{rpm, rpd, remaining_today}` to the `ai_budget` key
     // on a TTL, so Django sizes its in-flight cap from the gateway's own limits — and *pauses* if we
-    // die (the key expires). Publishes immediately, then every `budget_publish_secs`.
+    // die (the key expires). Also persists the learned limits (no TTL) so they survive a restart.
+    // Publishes immediately, then every `budget_publish_secs`.
     {
         let mut conn = publisher.clone();
         let mut budget_shutdown = shutdown_rx.clone();
@@ -104,6 +120,18 @@ async fn main() {
                 .await
                 {
                     log::warn!("failed to publish budget to '{}': {e}", cfg.budget_key);
+                }
+                if let Err(e) = redis_io::set_persistent(
+                    &mut conn,
+                    &cfg.learned_limits_key,
+                    &ratelimit::export_learned(),
+                )
+                .await
+                {
+                    log::warn!(
+                        "failed to persist learned limits to '{}': {e}",
+                        cfg.learned_limits_key
+                    );
                 }
                 tokio::select! {
                     _ = budget_shutdown.changed() => break,
@@ -223,6 +251,7 @@ async fn run_chain(
                     .await
                     {
                         Ok(out) => {
+                            ratelimit::record_success(name);
                             let neuron_note = out
                                 .neurons
                                 .map(|n| format!(", {n} neurons"))
@@ -242,6 +271,16 @@ async fn run_chain(
                             );
                         }
                         Err(e) => {
+                            // A 429 carries Google's real limits — feed it back so the limiter
+                            // self-calibrates. A per-minute cap becomes a pace-and-retry (contributes
+                            // to `soonest`); a per-day cap parks the provider (handled next pass).
+                            if let error::ProviderError::RateLimit(info) = &e {
+                                ratelimit::record_quota(name, info);
+                                if !matches!(info.scope, quota::QuotaScope::PerDay) {
+                                    let d = info.retry_after.unwrap_or(Duration::from_secs(10));
+                                    soonest = Some(soonest.map_or(d, |s| s.min(d)));
+                                }
+                            }
                             log::warn!("[{name}] job {} failed: {e} (failing over)", job.job_id);
                             last_err = format!("{name}: {e}");
                         }
@@ -252,9 +291,8 @@ async fn run_chain(
                 }
                 ratelimit::Acquire::DailyExhausted => {
                     log::warn!(
-                        "[{name}] job {} skipped: daily quota (rpd={}) exhausted",
-                        job.job_id,
-                        provider.rpd
+                        "[{name}] job {} skipped: daily quota exhausted (learned from Google)",
+                        job.job_id
                     );
                     last_err = format!("{name}: daily quota exhausted");
                 }

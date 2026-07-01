@@ -9,8 +9,10 @@
 pub enum ProviderError {
     /// 401/403 — bad or missing credentials.
     Auth(String),
-    /// 429 — upstream rate/quota limit.
-    RateLimit(String),
+    /// 429 — upstream rate/quota limit, carrying what Google told us about it (per-day vs
+    /// per-minute, the real `quotaValue`, and the suggested `retryDelay`). The caller feeds this
+    /// to the limiter so it self-calibrates instead of pacing off hardcoded numbers.
+    RateLimit(crate::quota::QuotaInfo),
     /// Any other non-2xx response.
     Api { status: u16, body: String },
     /// 2xx but the model returned no `content` (reasoning models do this) — treat as failure.
@@ -33,7 +35,7 @@ impl std::fmt::Display for ProviderError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ProviderError::Auth(m) => write!(f, "auth error: {m}"),
-            ProviderError::RateLimit(m) => write!(f, "rate limited: {m}"),
+            ProviderError::RateLimit(q) => write!(f, "rate limited: {q}"),
             ProviderError::Api { status, body } => write!(f, "api error {status}: {body}"),
             ProviderError::Empty => write!(f, "empty completion content"),
             ProviderError::Network(m) => write!(f, "network error: {m}"),
@@ -52,7 +54,7 @@ mod tests {
     fn transient_classification() {
         assert!(ProviderError::Timeout.is_transient());
         assert!(ProviderError::Network("reset".into()).is_transient());
-        assert!(!ProviderError::RateLimit("429".into()).is_transient());
+        assert!(!ProviderError::RateLimit(crate::quota::QuotaInfo::unknown()).is_transient());
         assert!(!ProviderError::Empty.is_transient());
         assert!(!ProviderError::Api {
             status: 500,

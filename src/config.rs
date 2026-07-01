@@ -37,6 +37,9 @@ pub struct Config {
     pub callback_timeout_secs: u64,
     /// Redis key the live budget `{rpm, rpd, remaining_today}` is published to, for Django's pacing.
     pub budget_key: String,
+    /// Redis key the learned per-provider limits are persisted to (no TTL), so a redeploy paces off
+    /// the last-known real numbers instead of re-learning them from 429s.
+    pub learned_limits_key: String,
     /// How often to republish the budget.
     pub budget_publish_secs: u64,
     /// TTL on the published budget key — if the gateway dies the key expires and Django pauses.
@@ -132,6 +135,8 @@ impl Config {
             callback_max_attempts: parse_or("CALLBACK_MAX_ATTEMPTS", 5u32),
             callback_timeout_secs: parse_or("CALLBACK_TIMEOUT_SECS", 15u64),
             budget_key: env::var("AI_BUDGET_KEY").unwrap_or_else(|_| "ai_budget".to_string()),
+            learned_limits_key: env::var("AI_LEARNED_LIMITS_KEY")
+                .unwrap_or_else(|_| "ai_learned_limits".to_string()),
             budget_publish_secs: parse_or("BUDGET_PUBLISH_SECS", 10u64),
             budget_ttl_secs: parse_or("BUDGET_TTL_SECS", 30u64),
             max_rpm_wait_secs: parse_or("MAX_RPM_WAIT_SECS", 120u64),

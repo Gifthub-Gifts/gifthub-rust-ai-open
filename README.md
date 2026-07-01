@@ -60,10 +60,16 @@ disappears:
   `NAME_MODEL` + optional `NAME_RPM` / `NAME_RPD`); no per-provider code. See `.env.example`.
 - **Failover.** Walk the chain in order; on `429` / empty content / any error, move to the next
   provider. Transient transport errors are retried per-provider with `2s, 5s, 11s, …` backoff.
-- **Per-provider budgets + pacing.** rpm + rpd token buckets (lazy proportional refill). An
-  rpm-limited job **waits** for the next token and retries (jobs buffer in `ai_jobs` and drain at the
-  sustainable rate) rather than being dropped; only the daily `rpd` cap is a hard stop (fail over /
-  error). The shared pool is published as `ai_budget` for Django to pace against.
+- **Self-calibrating limits — learned from Google, not hardcoded.** Google AI Studio never exposes
+  your quota (no rate-limit headers on any endpoint), but a `429` body does: it carries the real
+  `quotaValue`, whether it's a per-day or per-minute cap, and a `retryDelay`. So `NAME_RPM`/`NAME_RPD`
+  are only an *initial estimate* — the gateway **learns each provider's true limit the first time
+  Google rejects it** and paces off that. There is **no local daily cap**: it calls freely and only a
+  `PerDay` 429 stops a provider (so a generous account runs to its real ceiling instead of freezing at
+  a low config guess; recovery is the daily rollover). Per-minute stays a proactive token-bucket pacer
+  whose capacity becomes the learned rpm. Learned limits are persisted to Redis (`ai_learned_limits`)
+  and reloaded on boot, so a redeploy paces off the last-known numbers instead of re-learning them.
+  The learned pool is published as `ai_budget` for Django to pace against.
 - **`max_tokens` is opt-in per provider** (`NAME_MAX_TOKENS`) — omitted by default (a low cap makes
   some reasoning models return empty content), but **required for Cloudflare**, which otherwise
   truncates at ~256 tokens.

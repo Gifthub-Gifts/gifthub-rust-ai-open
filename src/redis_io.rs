@@ -55,3 +55,26 @@ pub async fn set_with_ttl(
         .query_async::<()>(conn)
         .await
 }
+
+/// Read a string value at `key` (`GET key`), or `None` if it's unset. Used to load the persisted
+/// learned provider limits at startup.
+pub async fn get_value(
+    conn: &mut ConnectionManager,
+    key: &str,
+) -> redis::RedisResult<Option<String>> {
+    redis::cmd("GET").arg(key).query_async(conn).await
+}
+
+/// Write a value at `key` with **no** TTL (`SET key value`). Used to persist the learned provider
+/// limits so they survive a restart (unlike the budget key, this must not expire).
+pub async fn set_persistent(
+    conn: &mut ConnectionManager,
+    key: &str,
+    value: &str,
+) -> redis::RedisResult<()> {
+    redis::cmd("SET")
+        .arg(key)
+        .arg(value)
+        .query_async::<()>(conn)
+        .await
+}

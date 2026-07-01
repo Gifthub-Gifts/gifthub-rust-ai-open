@@ -84,14 +84,17 @@ impl Provider {
         if status.as_u16() == 401 || status.as_u16() == 403 {
             return Err(ProviderError::Auth(status.to_string()));
         }
-        if status.as_u16() == 429 {
-            return Err(ProviderError::RateLimit(status.to_string()));
-        }
 
         let text = resp
             .text()
             .await
             .map_err(|e| ProviderError::Network(e.to_string()))?;
+
+        // A 429 carries the real quota facts (per-day/per-minute, quotaValue, retryDelay) in its
+        // body — parse them so the limiter learns Google's actual limits instead of a hardcoded cap.
+        if status.as_u16() == 429 {
+            return Err(ProviderError::RateLimit(crate::quota::parse_429(&text)));
+        }
         if !status.is_success() {
             return Err(ProviderError::Api {
                 status: status.as_u16(),
