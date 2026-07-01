@@ -4,38 +4,55 @@ A lean, multi-provider **LLM gateway** for GiftHub — the Phase 2 "beachhead" o
 roadmap. It pools free-tier LLM quotas behind one OpenAI-shaped interface with failover, so the
 Django app can draft/review product content without an always-on Python worker doing the I/O.
 
-**Django stays the system-of-record.** This service never touches the database or Django's ORM —
-it only reads jobs from Redis, calls LLM providers, and writes results back to Redis.
+**Django stays the system-of-record.** This service never touches the database or Django's ORM — it
+reads jobs from Redis, calls LLM providers, and **POSTs results back to Django over HTTP** (it also
+publishes its live rate-limit budget to Redis so Django can pace how much it dispatches).
 
 ## How it fits
 
 ```
 Django (Celery task)                          gifthub-rust-ai (this service)
-  build prompt                                   BLPOP ai_jobs  ───────────────┐
-  RPUSH ai_jobs {job_id,purpose,messages} ─────▶ run failover chain (FIFO):    │
-                                                   provider A → 429/empty/err → B → …
-  BRPOP ai_result:{job_id}  ◀───────────────────  RPUSH ai_result:{job_id} {…} ┘
-  write ProductContent DRAFT (Django owns DB)
+  build prompt                                   BLPOP ai_jobs  ──────────────────────┐
+  RPUSH ai_jobs {job_id,purpose,                 run failover chain (FIFO), pacing     │
+              messages,callback}  ─────────────▶   on rpm: A → 429/empty/err → B → …   │
+  (returns immediately — fire-and-forget)                                              │
+  POST /internal/ai/callback/  ◀───────────────  POST result {job_id,callback,ok,…}  ──┘
+  (HMAC-verified) → advance ProductContent       (X-AI-Signature: sha256=<HMAC>)
+  reads ai_budget ◀──────────────────────────── SET ai_budget {rpm,rpd,remaining_today}
 ```
 
-### Redis job contract
+### Job contract
 
-Producer (Django) → `ai_jobs` (list), JSON:
+Producer (Django) → `ai_jobs` (Redis list), JSON:
 
 ```json
-{ "job_id": "uuid", "purpose": "writer", "messages": [ { "role": "user", "content": "…" } ] }
+{ "job_id": "uuid", "purpose": "generator", "messages": [ { "role": "user", "content": "…" } ], "callback": { "content_id": 7, "step": "generator" } }
 ```
 
-- `purpose` (optional) selects a failover chain (`writer` / `judge`); omit for the default chain.
+- `purpose` (optional) selects a failover chain (`generator` / `translator` / `reviewer`; legacy
+  `writer` / `judge` still work); omit for the default chain.
+- `callback` is an **opaque** blob the gateway echoes back verbatim — it never inspects or mutates it.
 
-Consumer (Django) ← `ai_result:{job_id}` (list, TTL'd), JSON — exactly one of `content`/`error`:
+Result → **HTTP POST** to `DJANGO_CALLBACK_URL`, signed `X-AI-Signature: sha256=<hex HMAC-SHA256 of
+the body, keyed by the shared secret>`, JSON:
 
 ```json
-{ "job_id": "uuid", "content": "…", "error": null, "provider": "cloudflare", "model": "@cf/meta/llama-3.3-70b-instruct-fp8-fast", "neurons": 58.7 }
+{ "job_id": "uuid", "callback": { "content_id": 7, "step": "generator" }, "ok": true, "content": "…", "error": null, "provider": "gemini_lite", "model": "gemini-2.5-flash", "neurons": null }
 ```
 
-- `provider` / `model` name the source of the content (both `null` on failure) so Django can record
-  the real model on each draft instead of guessing.
+- `ok` discriminates success (`content`/`provider`/`model` set) from failure (`error` set).
+- Any 2xx is "delivered"; on non-2xx / transport error the gateway retries with backoff a bounded
+  number of times, then drops (Django's reaper re-dispatches the step).
+
+### Budget contract
+
+The gateway publishes the shared pool to the `ai_budget` Redis key (TTL'd, refreshed every few
+seconds) so Django sizes its in-flight cap from the gateway's *own* limits and pauses if the key
+disappears:
+
+```json
+{ "rpm": 5, "rpd": 400, "remaining_today": 137 }
+```
 
 ## Design
 
@@ -43,8 +60,10 @@ Consumer (Django) ← `ai_result:{job_id}` (list, TTL'd), JSON — exactly one o
   `NAME_MODEL` + optional `NAME_RPM` / `NAME_RPD`); no per-provider code. See `.env.example`.
 - **Failover.** Walk the chain in order; on `429` / empty content / any error, move to the next
   provider. Transient transport errors are retried per-provider with `2s, 5s, 11s, …` backoff.
-- **Per-provider budgets.** rpm + rpd token buckets (lazy proportional refill) skip an exhausted
-  provider rather than burning its upstream quota.
+- **Per-provider budgets + pacing.** rpm + rpd token buckets (lazy proportional refill). An
+  rpm-limited job **waits** for the next token and retries (jobs buffer in `ai_jobs` and drain at the
+  sustainable rate) rather than being dropped; only the daily `rpd` cap is a hard stop (fail over /
+  error). The shared pool is published as `ai_budget` for Django to pace against.
 - **`max_tokens` is opt-in per provider** (`NAME_MAX_TOKENS`) — omitted by default (a low cap makes
   some reasoning models return empty content), but **required for Cloudflare**, which otherwise
   truncates at ~256 tokens.
@@ -53,7 +72,7 @@ Consumer (Django) ← `ai_result:{job_id}` (list, TTL'd), JSON — exactly one o
 ## Run
 
 ```bash
-cp .env.example .env   # fill in REDIS_URL + provider keys
+cp .env.example .env   # fill in REDIS_URL, DJANGO_CALLBACK_URL, AI_GATEWAY_WEBHOOK_SECRET + provider keys
 cargo run              # dev
 cargo build --release  # prod binary at target/release/gifthub-rust-ai
 ```
@@ -84,10 +103,11 @@ the required GitHub secrets are documented in **[DEPLOY.md](DEPLOY.md)**.
   been run end-to-end against a live Redis or real LLM endpoints. Next milestone: a smoke test
   against a local Redis + one provider.
 - **At-least-once is not guaranteed.** A job is popped with `BLPOP` (removed from `ai_jobs`) before
-  it's processed; if the gateway *crashes* between pop and publish, that job is lost and Django's
-  `BRPOP ai_result:{job_id}` will time out (re-enqueue on the Django side). A graceful shutdown
-  (SIGTERM) now drains in-flight jobs, so this only bites on a hard crash; a fully reliable-queue
-  pattern (`LMOVE` into a processing list + reclaim) is still deferred.
+  it's processed; if the gateway *crashes* between pop and callback — or the callback POST fails past
+  its retries — that step is lost. Django's reaper reclaims any row whose callback never arrives and
+  re-dispatches the missing step, so this self-heals; a graceful shutdown (SIGTERM) also drains
+  in-flight jobs (and stops waiting for rpm slots). A fully reliable-queue pattern (`LMOVE` into a
+  processing list + reclaim) is still deferred.
 - **`panic = "abort"`** (size-optimized profile) means a panic in any task aborts the whole process
   — there is no per-task isolation. The hot path avoids panics; `systemd Restart=always` recovers.
 - **Neuron accounting is effectively off** with the documented OpenAI-compat Cloudflare endpoint —

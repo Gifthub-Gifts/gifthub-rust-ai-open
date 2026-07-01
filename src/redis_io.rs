@@ -1,4 +1,8 @@
-//! Redis I/O: the only boundary between Django and this service.
+//! Redis I/O: jobs in, budget out.
+//!
+//! Django enqueues jobs onto the `ai_jobs` list (consumed here via `BLPOP`); the gateway publishes its
+//! live budget to the `ai_budget` key (`set_with_ttl`). Finished *results* no longer travel over Redis —
+//! they're POSTed straight to Django (see `callback.rs`).
 //!
 //! Mirrors the `vpn-watchdog`/`telegram-happ-rust` pool idiom — build one cloneable connection
 //! handle at boot and pass `&mut` clones into tasks; free functions take the connection first.
@@ -33,28 +37,21 @@ pub async fn pop_job(
     Ok(res.map(|(_key, value)| value))
 }
 
-/// Publish a result onto `{prefix}{job_id}` and set a TTL so unclaimed results self-expire.
-/// Django consumes it with a matching `BRPOP {prefix}{job_id}`.
-pub async fn publish_result(
+/// Publish a short-lived value at `key` with a TTL (`SET key value EX ttl`). Used to publish the live
+/// budget snapshot so that if the gateway dies the key expires and Django's dispatcher pauses (rather
+/// than pacing against a stale budget). Results are no longer written to Redis — they're POSTed to
+/// Django directly (see `callback.rs`).
+pub async fn set_with_ttl(
     conn: &mut ConnectionManager,
-    prefix: &str,
+    key: &str,
+    value: &str,
     ttl_secs: u64,
-    job_id: &str,
-    payload: &str,
 ) -> redis::RedisResult<()> {
-    let key = format!("{prefix}{job_id}");
-    // RPUSH + EXPIRE in one pipelined round-trip, so we can't crash/disconnect between them and
-    // leave the result key without a TTL (which would leak it forever if Django never consumes it).
-    redis::pipe()
-        .cmd("RPUSH")
-        .arg(&key)
-        .arg(payload)
-        .ignore()
-        .cmd("EXPIRE")
-        .arg(&key)
+    redis::cmd("SET")
+        .arg(key)
+        .arg(value)
+        .arg("EX")
         .arg(ttl_secs)
-        .ignore()
         .query_async::<()>(conn)
-        .await?;
-    Ok(())
+        .await
 }

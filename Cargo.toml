@@ -12,6 +12,10 @@ serde_json = "1"
 dotenv = "0.15"
 log = "0.4"
 env_logger = "0.11"
+# Sign the result callback to Django (X-AI-Signature: sha256=<hex HMAC-SHA256 of the body>).
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
 
 # Size-optimized release binary — this whole service exists to shave server RAM,
 # so the binary is built small (mirrors the vpn-watchdog house profile).

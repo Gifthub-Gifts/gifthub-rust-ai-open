@@ -26,8 +26,24 @@ pub fn get_config() -> &'static Config {
 pub struct Config {
     pub redis_url: String,
     pub jobs_key: String,
-    pub result_prefix: String,
-    pub result_ttl_secs: u64,
+    /// Django endpoint we POST each finished [`crate::job::JobResult`] to (HMAC-signed). Required.
+    pub callback_url: String,
+    /// Shared secret for the `X-AI-Signature` HMAC (must match Django's `AI_GATEWAY_WEBHOOK_SECRET`).
+    pub webhook_secret: String,
+    /// Bounded retries when a callback POST fails (non-2xx / transport); then drop (Django reaps).
+    pub callback_max_attempts: u32,
+    /// Per-attempt timeout for the callback POST (overrides the shared client's request timeout, which
+    /// is sized for slow LLMs). Keeps a hung Django from pinning a worker for a full LLM timeout.
+    pub callback_timeout_secs: u64,
+    /// Redis key the live budget `{rpm, rpd, remaining_today}` is published to, for Django's pacing.
+    pub budget_key: String,
+    /// How often to republish the budget.
+    pub budget_publish_secs: u64,
+    /// TTL on the published budget key — if the gateway dies the key expires and Django pauses.
+    pub budget_ttl_secs: u64,
+    /// Upper bound on how long one job may wait for an rpm slot before giving up (then errors;
+    /// Django's reaper re-dispatches). Caps how long a job can hold a concurrency permit.
+    pub max_rpm_wait_secs: u64,
     pub pop_timeout_secs: u64,
     pub max_concurrency: usize,
     pub connect_timeout_secs: u64,
@@ -108,9 +124,17 @@ impl Config {
         Config {
             redis_url: env::var("REDIS_URL").expect("REDIS_URL must be set"),
             jobs_key: env::var("AI_JOBS_KEY").unwrap_or_else(|_| "ai_jobs".to_string()),
-            result_prefix: env::var("AI_RESULT_PREFIX")
-                .unwrap_or_else(|_| "ai_result:".to_string()),
-            result_ttl_secs: parse_or("AI_RESULT_TTL_SECS", 300u64),
+            callback_url: env::var("DJANGO_CALLBACK_URL").expect(
+                "DJANGO_CALLBACK_URL must be set (e.g. http://127.0.0.1:8000/internal/ai/callback/)",
+            ),
+            webhook_secret: env::var("AI_GATEWAY_WEBHOOK_SECRET")
+                .expect("AI_GATEWAY_WEBHOOK_SECRET must be set (must match Django)"),
+            callback_max_attempts: parse_or("CALLBACK_MAX_ATTEMPTS", 5u32),
+            callback_timeout_secs: parse_or("CALLBACK_TIMEOUT_SECS", 15u64),
+            budget_key: env::var("AI_BUDGET_KEY").unwrap_or_else(|_| "ai_budget".to_string()),
+            budget_publish_secs: parse_or("BUDGET_PUBLISH_SECS", 10u64),
+            budget_ttl_secs: parse_or("BUDGET_TTL_SECS", 30u64),
+            max_rpm_wait_secs: parse_or("MAX_RPM_WAIT_SECS", 120u64),
             pop_timeout_secs: parse_or("POP_TIMEOUT_SECS", 5u64),
             max_concurrency: parse_or("MAX_CONCURRENCY", 4usize),
             connect_timeout_secs: parse_or("CONNECT_TIMEOUT_SECS", 15u64),
@@ -133,6 +157,15 @@ impl Config {
 
     pub fn provider_order_display(&self) -> String {
         self.provider_order.join(", ")
+    }
+
+    /// `(name, rpm, rpd)` for every configured provider, in declared order — the shared budget pool
+    /// the gateway publishes for Django to pace against (all chains draw from these providers).
+    pub fn provider_budgets(&self) -> Vec<(String, u32, u32)> {
+        self.provider_order
+            .iter()
+            .filter_map(|n| self.providers.get(n).map(|p| (n.clone(), p.rpm, p.rpd)))
+            .collect()
     }
 }
 
