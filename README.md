@@ -95,13 +95,13 @@ CI runs `fmt --check`, `check`, `test`, release `build` (all `--locked`), and `c
 
 ## Deploy
 
-`.github/workflows/deploy.yml` (push to `main` or manual `workflow_dispatch` with a `DEPLOY`
+A GitHub Actions deploy workflow (push to `main` or manual `workflow_dispatch` with a `DEPLOY`
 confirm) builds the release binary, scp's it to the host, atomic-renames, restarts the
 `gifthub-rust-ai.service` systemd unit, health-checks via journald (greps the
 `🚀 gifthub-rust-ai started` ready marker), and rolls back to the previous binary on failure. The
 binary is the whole artifact — there's no DB/migrations. Runtime config (`REDIS_URL` + provider API
-keys) lives in a host `.env`, never in CI. Setup, the unit (`deploy/gifthub-rust-ai.service`), and
-the required GitHub secrets are documented in **[DEPLOY.md](DEPLOY.md)**.
+keys) lives in a host `.env`, never in CI. The deploy workflow, the systemd unit and the host setup
+are kept in the private production repo.
 
 ## Known limitations (this is a scaffold)
 
