@@ -1,0 +1,177 @@
+name: Deploy to production
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type DEPLOY to confirm (manual deploy only)'
+        required: false
+        default: ''
+
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false
+
+env:
+  # Host and user come from the repo variables PROD_HOST and PROD_USER; the job is skipped when
+  # PROD_HOST is unset. The only secret is the SSH private key. The gateway runs on the SAME host as
+  # Django so it reaches the local Redis.
+  PROD_USER: ${{ vars.PROD_USER }}
+  PROD_HOST: ${{ vars.PROD_HOST }}
+  PROD_DIR: /srv/gifthub-rust-ai
+  SERVICE: gifthub-rust-ai.service
+  BIN: gifthub-rust-ai
+  # Greppable ready marker emitted by main.rs once it starts consuming the jobs list.
+  READY_MARKER: gifthub-rust-ai started
+
+jobs:
+  deploy:
+    name: build + deploy
+    if: ${{ vars.PROD_HOST != '' }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 25
+
+    steps:
+      - name: guard — manual deploy must type DEPLOY
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          if [ "${{ inputs.confirm }}" != "DEPLOY" ]; then
+            echo "::error::Refusing manual deploy: confirm input must be literal 'DEPLOY'."
+            exit 1
+          fi
+
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: install rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: build
+
+      - name: cargo check
+        run: cargo check --all-targets --locked
+
+      - name: cargo test
+        run: cargo test --all-targets --locked
+
+      - name: cargo build --release
+        run: cargo build --release --locked
+
+      - name: binary sanity
+        run: |
+          file "target/release/${BIN}"
+          test -x "target/release/${BIN}"
+
+      - name: configure SSH
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          # Live host-key scan (same as the gifthub deploy) — no host-key secret to manage.
+          ssh-keyscan -t ed25519,rsa "$PROD_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+          chmod 644 ~/.ssh/known_hosts
+
+      - name: preflight — reach prod
+        run: |
+          ssh -i ~/.ssh/id_ed25519 -o ConnectTimeout=15 -o BatchMode=yes \
+              "${PROD_USER}@${PROD_HOST}" "echo ok; sudo systemctl is-active ${SERVICE} || true"
+
+      - name: backup current binary
+        run: |
+          # Snapshot the running binary so rollback can restore it. The gateway has no DB/migrations,
+          # so the binary is the whole artifact. Tolerate the first deploy (no binary yet).
+          ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes "${PROD_USER}@${PROD_HOST}" '
+            set -e
+            if [ -x "'"${PROD_DIR}"'/'"${BIN}"'" ]; then
+              cp "'"${PROD_DIR}"'/'"${BIN}"'" "'"${PROD_DIR}"'/'"${BIN}"'.previous"
+              ls -la "'"${PROD_DIR}"'/'"${BIN}"'"* | head -5
+            else
+              echo "no current binary — first deploy"
+            fi
+          '
+
+      - name: stop service
+        run: |
+          ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes "${PROD_USER}@${PROD_HOST}" \
+              "sudo systemctl stop ${SERVICE}; sudo systemctl is-active ${SERVICE}; exit 0"
+
+      - name: upload binary
+        run: |
+          scp -i ~/.ssh/id_ed25519 -o BatchMode=yes \
+              "target/release/${BIN}" \
+              "${PROD_USER}@${PROD_HOST}:${PROD_DIR}/${BIN}.new"
+
+          # chmod then atomic rename so a partial scp can't leave a corrupt binary.
+          ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes "${PROD_USER}@${PROD_HOST}" \
+              "chmod 755 '${PROD_DIR}/${BIN}.new' && mv '${PROD_DIR}/${BIN}.new' '${PROD_DIR}/${BIN}' && ls -la '${PROD_DIR}/${BIN}'"
+
+      - name: start service + health check
+        id: health
+        run: |
+          set -e
+          ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes "${PROD_USER}@${PROD_HOST}" "sudo systemctl start ${SERVICE}"
+
+          # Give it a moment to connect to Redis and emit the ready marker.
+          sleep 6
+
+          ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes "${PROD_USER}@${PROD_HOST}" '
+            set -e
+            STATE=$(sudo systemctl is-active '"${SERVICE}"' || true)
+            echo "systemctl is-active: $STATE"
+            if [ "$STATE" != "active" ]; then
+              echo "::error::service not active"
+              sudo journalctl -u '"${SERVICE}"' -n 80 --no-pager || true
+              exit 1
+            fi
+            LOG=$(sudo journalctl -u '"${SERVICE}"' --since "30 seconds ago" --no-pager)
+            echo "$LOG" | tail -40
+            if echo "$LOG" | grep -Ei "panic|thread .* panicked|FATAL|SIGSEGV" ; then
+              echo "::error::panic or fatal error in startup log"
+              exit 1
+            fi
+            if ! echo "$LOG" | grep -q "'"${READY_MARKER}"'"; then
+              echo "::warning::did not see ready marker yet"
+            fi
+            echo "health check: ok"
+          '
+
+      - name: rollback on failure
+        if: failure() && steps.health.outcome == 'failure'
+        run: |
+          echo "::warning::rolling back to previous binary"
+          ssh -i ~/.ssh/id_ed25519 -o BatchMode=yes "${PROD_USER}@${PROD_HOST}" '
+            set -e
+            sudo systemctl stop '"${SERVICE}"' || true
+            if [ ! -x "'"${PROD_DIR}"'/'"${BIN}"'.previous" ]; then
+              echo "::error::no previous binary found — manual intervention needed"
+              exit 1
+            fi
+            cp "'"${PROD_DIR}"'/'"${BIN}"'.previous" "'"${PROD_DIR}"'/'"${BIN}"'"
+            sudo systemctl start '"${SERVICE}"'
+            ok=0
+            for i in 1 2 3 4 5 6; do
+              sleep 4
+              STATE=$(sudo systemctl is-active '"${SERVICE}"' || true)
+              echo "rollback poll #$i: $STATE"
+              if [ "$STATE" = "active" ]; then ok=1; break; fi
+            done
+            if [ "$ok" = "1" ]; then
+              echo "rollback complete"
+            else
+              sudo journalctl -u '"${SERVICE}"' -n 60 --no-pager || true
+              echo "::error::rollback failed — service did not return to active"
+              exit 1
+            fi
+          '
+
+      - name: cleanup SSH key
+        if: always()
+        run: rm -f ~/.ssh/id_ed25519

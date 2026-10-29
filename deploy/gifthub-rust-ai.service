@@ -1,0 +1,31 @@
+[Unit]
+Description=GiftHub Rust AI gateway (LLM job consumer)
+# Talks to the local Redis only; come up after the network and redis.
+After=network.target redis-server.service
+Wants=redis-server.service
+
+[Service]
+# Matches the sibling /srv/gifthub* units on this host (run as root, EnvironmentFile on disk).
+User=root
+Group=root
+WorkingDirectory=/srv/gifthub-rust-ai
+# Runtime config (REDIS_URL + provider API keys) lives here, NOT in the repo or CI. See DEPLOY.md.
+EnvironmentFile=/srv/gifthub-rust-ai/.env
+ExecStart=/srv/gifthub-rust-ai/gifthub-rust-ai
+Restart=always
+RestartSec=3
+# The process handles SIGTERM (graceful drain of in-flight jobs); give it room before SIGKILL.
+KillSignal=SIGTERM
+TimeoutStopSec=90
+# This service exists to save RAM — keep it on a short leash.
+MemoryMax=200M
+
+# Logs go to journald; the deploy health-check greps `journalctl -u gifthub-rust-ai`.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=gifthub-rust-ai
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
